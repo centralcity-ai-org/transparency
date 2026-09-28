@@ -1,0 +1,25 @@
+{
+  "name": "@centralcity/transparency",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Witness and verifier for Central City's public agent count.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "verify-count": "./verifier/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && tsx --test tests/*.test.ts",
+    "verify": "tsx verifier/cli.ts",
+    "witness": "tsx witness/update.ts"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}
