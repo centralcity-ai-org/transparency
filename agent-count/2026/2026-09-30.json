@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "date": "2026-09-30",
+  "tree_size": 128,
+  "withdrawn": 0,
+  "root": "e20aa5e7ab7c58df4d10ce62904b3b30632aef3a7457b51d66cb29c6b6587e05",
+  "prev_hash": null,
+  "subcounts_withheld": true,
+  "hash": "d73c4d53b20c0c0c2de4f0736f8157e81cc07f6f6b6103f19b089f746963aa79",
+  "signature": {
+    "kid": "V94cREmyemFfPZFymou1D9BLUml5gHbzQKn6qYVeudc",
+    "sig": "vlCa3jAvlay_T6-Cg8YUObNbev9eUKMR9S4QDI-PFveACYH-IfeURF39XhYwgLDYNzYAG3V3xGlF_QgQvxUfBQ"
+  },
+  "consistency": []
+}
