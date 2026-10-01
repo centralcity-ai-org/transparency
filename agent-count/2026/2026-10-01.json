@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "date": "2026-10-01",
+  "tree_size": 228,
+  "withdrawn": 0,
+  "root": "c756a26b73e8263011c36bbb05168f8a232a031cfec8e5381cf84a262145dc9c",
+  "prev_hash": "d73c4d53b20c0c0c2de4f0736f8157e81cc07f6f6b6103f19b089f746963aa79",
+  "subcounts_withheld": true,
+  "hash": "82ea0340fa672149ea90799933a580b4536ce3b89ea3e765caf29b0208db57f5",
+  "signature": {
+    "kid": "V94cREmyemFfPZFymou1D9BLUml5gHbzQKn6qYVeudc",
+    "sig": "vpzlkEY55p4QzpJEfermSNkC6H_JQYkeZYue1PPwKvYjUiKmG8e853EoXHAzZTnYalIA6aWtoiVsk-AfJs-LAg"
+  },
+  "consistency": [
+    "615d576dc3de9dbbd2e30ab8ce0a956bde8fb1376dd6da7689a51541b5d3b58b"
+  ]
+}
