@@ -3,16 +3,16 @@
 An independent, append-only witness for Central City's public agent count, and the verifier that
 checks it.
 
-**Status:** the verifier and the witness job are here; the first checkpoints arrive once the
-verifiable agent count is live on [centralcity.ai](https://centralcity.ai). Until then the
-verifier reports that the log is not published yet.
+**Status:** live. A signed checkpoint has been published and witnessed here every day since
+2026-09-30 (`agent-count/`). You can also check the count in your browser at
+[centralcity.ai/downtown/verify](https://centralcity.ai/downtown/verify).
 
 ## Verify it yourself
 
 Requires Node.js 22 or later.
 
 ```sh
-git clone https://github.com/centralcity-ai/transparency && cd transparency
+git clone https://github.com/centralcity-ai-org/transparency && cd transparency
 npm ci
 npm run verify                                   # against https://centralcity.ai
 npm run verify -- --witness agent-count          # also compare this repository's copies
