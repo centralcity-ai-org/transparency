@@ -1,11 +1,11 @@
 name: witness
 
-# Once a day, after the service's 00:10 UTC checkpoint: verify the public log and commit any new
+# Once a day, after the service's 10:00 UTC checkpoint: verify the public log and commit any new
 # checkpoint under agent-count/. Uses only this repository's own GITHUB_TOKEN (contents: write);
 # files are only ever added. Enabled by the repository variable WITNESS_ENABLED=true.
 on:
   schedule:
-    - cron: '40 0 * * *'
+    - cron: '40 10 * * *'
   workflow_dispatch:
 
 permissions:
