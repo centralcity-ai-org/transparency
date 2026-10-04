@@ -11,7 +11,8 @@
 //      for byte (see sameWitnessedDay), and one agent's inclusion proof.
 import {
   type AgentProof,
-  type PublicCheckpoint as Checkpoint,
+  type Checkpoint as FullCheckpoint,
+  type PublicCheckpoint,
   isWithheld,
   fromHex,
   merkleRoot,
@@ -20,6 +21,15 @@ import {
   verifyChain,
   verifyCheckpointSignature,
 } from './count-log.js';
+
+/**
+ * A checkpoint as a service may serve it: v2, a withheld v1, or (from a service that predates
+ * the withheld form) a full legacy v1, whose hash and signature are checked as before.
+ */
+export type Checkpoint = PublicCheckpoint | FullCheckpoint;
+
+/** Whether a checkpoint carries per-category counts (a full legacy v1). */
+export const hasSubcounts = (checkpoint: Checkpoint) => 'subcounts' in checkpoint;
 
 export interface Jwk {
   kty: string;
@@ -48,11 +58,10 @@ export interface Report {
 }
 
 /**
- * The witness file for a checkpoint: the same path and bytes the service publishes. Refuses a
- * checkpoint that carries per-category counts: those are never witnessed.
+ * The witness file for a checkpoint: the same path and bytes the service publishes. The witness
+ * job (witness/update.ts) refuses to write one that carries per-category counts (hasSubcounts).
  */
 export function witnessFile(folder: string, checkpoint: Checkpoint) {
-  if ('subcounts' in checkpoint) throw new Error(`${checkpoint.date}: per-category counts are never witnessed`);
   const [year] = checkpoint.date.split('-');
   return {
     path: `${folder}/${year}/${checkpoint.date}.json`,
@@ -124,27 +133,55 @@ export async function verifyLog(log: PublicLog): Promise<Report> {
   };
 }
 
-/** The fields a withheld v1 checkpoint still publishes. */
-const WITHHELD_FIELDS = ['v', 'date', 'tree_size', 'withdrawn', 'root', 'subcounts_withheld', 'consistency'] as const;
+/** The tree fields every form of a v1 checkpoint publishes. */
+const V1_TREE_FIELDS = ['v', 'date', 'tree_size', 'withdrawn', 'root', 'consistency'] as const;
+/** Further v1 fields compared when both copies carry them. */
+const V1_OPTIONAL_FIELDS = ['prev_hash', 'hash', 'signature'] as const;
 
 /**
- * Whether a witnessed file records the same day the service publishes now: byte for byte, with one
- * exception. A v1 day witnessed before v1 signatures were withheld may carry fields the service no
- * longer publishes; the file is kept as it is (files are only ever added), and every field the
- * service still publishes for that day must match exactly.
+ * Whether a witnessed file records the same day the service publishes: byte for byte, with one
+ * exception for v1 days. A v1 day may be witnessed in an older form than the service serves now
+ * (with or without its signed fields); the file is kept as it is (files are only ever added). The
+ * two copies are the same day when the tree fields match exactly, and so does every signed field
+ * both copies carry.
  */
 export function sameWitnessedDay(content: string, live: Checkpoint): boolean {
   if (content === witnessFile('', live).content) return true;
-  if (!isWithheld(live)) return false;
+  if (live.v !== 1) return false;
   let witnessed: Record<string, unknown>;
   try {
     witnessed = JSON.parse(content) as Record<string, unknown>;
   } catch {
     return false;
   }
-  if (witnessed.v !== 1 || witnessed.subcounts_withheld !== true || 'subcounts' in witnessed) return false;
-  const pick = (cp: Record<string, unknown>) => JSON.stringify(WITHHELD_FIELDS.map((key) => cp[key]));
-  return pick(witnessed) === pick(live as unknown as Record<string, unknown>);
+  if (witnessed === null || typeof witnessed !== 'object' || witnessed.v !== 1) return false;
+  const current = live as unknown as Record<string, unknown>;
+  const same = (key: string) => JSON.stringify(witnessed[key]) === JSON.stringify(current[key]);
+  if (!V1_TREE_FIELDS.every(same)) return false;
+  return V1_OPTIONAL_FIELDS.every((key) => !(key in witnessed) || !(key in current) || same(key));
+}
+
+/**
+ * What the witness job does with the service's checkpoints, given the files it already has
+ * (`read` returns a file's content, or undefined when there is none): files to add, witnessed
+ * days whose content changed, and days refused because they carry per-category counts. When any
+ * day is refused, nothing is added.
+ */
+export function witnessPlan(
+  folder: string,
+  checkpoints: readonly Checkpoint[],
+  read: (path: string) => string | undefined,
+): { add: { path: string; content: string }[]; changed: string[]; refused: string[] } {
+  const refused = checkpoints.filter(hasSubcounts).map((cp) => cp.date);
+  const add: { path: string; content: string }[] = [];
+  const changed: string[] = [];
+  for (const checkpoint of checkpoints) {
+    const file = witnessFile(folder, checkpoint);
+    const existing = read(file.path);
+    if (existing === undefined) add.push(file);
+    else if (!sameWitnessedDay(existing, checkpoint)) changed.push(file.path);
+  }
+  return { add: refused.length ? [] : add, changed, refused };
 }
 
 /** Compares witness files (path → content) with the service's checkpoints. */

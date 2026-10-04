@@ -30,6 +30,8 @@ import {
   verifyAgent,
   verifyLog,
   witnessFile,
+  witnessPlan,
+  type Checkpoint as VerifiedCheckpoint,
   type PublicLog,
 } from '../verifier/verify.js';
 
@@ -52,7 +54,11 @@ test('RFC 6962 reference vectors: roots, audit paths, consistency proofs', async
 });
 
 /** A synthetic public log: `days` checkpoints over growing trees, signed with a fresh key. */
-async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() => 2)) {
+async function syntheticLog(
+  sizes: number[],
+  versions: (1 | 2)[] = sizes.map(() => 2),
+  options: { full?: boolean } = {},
+) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const jwk = { ...(publicKey.export({ format: 'jwk' }) as { kty: string; crv: string; x: string }), kid: 'test-key' };
   const agents = Array.from({ length: Math.max(...sizes) }, (_, idx) => ({
@@ -61,7 +67,7 @@ async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() 
     day: `2026-09-${String(10 + Math.floor(idx / 3)).padStart(2, '0')}`,
   }));
   const leafHashes = await Promise.all(agents.map((a) => agentLeafHash(a.id, a.salt, a.day)));
-  const checkpoints: PublicCheckpoint[] = [];
+  const checkpoints: VerifiedCheckpoint[] = [];
   let previous: { hash: string; tree_size: number } | null = null;
   for (const [index, size] of sizes.entries()) {
     const root = toHex(await merkleRoot(leafHashes.slice(0, size)));
@@ -87,7 +93,8 @@ async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() 
         ? (await consistencyProof(leafHashes.slice(0, size), previous.tree_size)).map(toHex)
         : [];
     const checkpoint: Checkpoint = { ...body, hash, signature: { kid: 'test-key', sig }, consistency };
-    checkpoints.push(toPublicCheckpoint(checkpoint));
+    // full: a legacy service that still served v1 with its counts.
+    checkpoints.push(options.full ? checkpoint : toPublicCheckpoint(checkpoint));
     previous = checkpoint;
   }
   const log: PublicLog = {
@@ -101,7 +108,7 @@ async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() 
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 /** A published v2 checkpoint (these synthetic logs are v2 unless versions say otherwise). */
-const v2 = (cp: PublicCheckpoint | undefined) => cp as PublicCheckpointV2;
+const v2 = (cp: VerifiedCheckpoint | undefined) => cp as PublicCheckpointV2;
 
 test('a valid log verifies', async () => {
   const { log } = await syntheticLog([3, 5, 9]);
@@ -315,10 +322,49 @@ test('witness: per-category counts are never witnessed; older copies of withheld
   const v2 = log.checkpoints[2]!;
   assert.equal(sameWitnessedDay(witnessFile('agent-count', v2).content, v2), true);
   assert.equal(sameWitnessedDay(witnessFile('agent-count', v2).content.replace(/\n$/, ''), v2), false);
-  // A checkpoint with per-category counts is refused; a witnessed file with them never matches.
+  // The witness job refuses to write a checkpoint with per-category counts (and writes nothing).
   const full = { ...v1, subcounts: { in_person_accounts: 1, in_ai_workspaces: 1, unclaimed: 1, revoked: 0 } };
-  assert.throws(() => witnessFile('agent-count', full as unknown as PublicCheckpoint), /never witnessed/);
-  assert.equal(sameWitnessedDay(`${JSON.stringify(full, null, 2)}\n`, v1), false);
+  const plan = witnessPlan('agent-count', [full as unknown as Checkpoint, v2], () => undefined);
+  assert.deepEqual(plan.refused, ['2026-09-20']);
+  assert.deepEqual(plan.add, []);
+  const clean = witnessPlan('agent-count', log.checkpoints, () => undefined);
+  assert.deepEqual([clean.refused, clean.add.length], [[], 3]);
+});
+
+test('a full legacy v1 log (served before the withheld form) is checked as before and does not crash', async () => {
+  const { log } = await syntheticLog([3, 5], [1, 1], { full: true });
+  for (const cp of log.checkpoints) assert.ok('subcounts' in cp && 'hash' in cp);
+  const report = await verifyLog(log);
+  assert.deepEqual([report.problems, report.unchecked], [[], []]);
+  assert.equal(resultLine(report), 'RESULT: VERIFIED');
+  // Its hash and signature are checked.
+  const badSig = clone(log);
+  v2(badSig.checkpoints[0]).signature!.sig = v2(badSig.checkpoints[1]).signature!.sig;
+  assert.ok((await verifyLog(badSig)).problems.some((p) => /bad signature/.test(p)));
+  const badCount = clone(log);
+  badCount.checkpoints[1]!.tree_size = 6;
+  assert.ok((await verifyLog(badCount)).problems.some((p) => /hash does not match/.test(p)));
+  // Comparing witness files against it does not throw. Files witnessed in the withheld form
+  // (older, with hash and signature, or current, without) are the same day; a different hash is not.
+  const current = new Map<string, string>();
+  const older = new Map<string, string>();
+  for (const cp of log.checkpoints) {
+    const path = witnessFile('agent-count', cp).path;
+    const { subcounts: _s, ...rest } = cp as Checkpoint & { subcounts: unknown };
+    current.set(path, witnessFile('agent-count', { ...toPublicCheckpoint(cp as Checkpoint) }).content);
+    older.set(path, `${JSON.stringify({ ...rest, subcounts_withheld: true }, null, 2)}\n`);
+  }
+  assert.deepEqual(compareWitness('agent-count', current, log.checkpoints), []);
+  assert.deepEqual(compareWitness('agent-count', older, log.checkpoints), []);
+  const [firstPath, firstContent] = [...older][0]!;
+  const tampered = new Map([[firstPath, firstContent.replace(/"hash": "[0-9a-f]+"/, `"hash": "${'ab'.repeat(32)}"`)]]);
+  assert.equal(compareWitness('agent-count', tampered, log.checkpoints).length, 1);
+  // A witnessed file that carries the counts still matches the same full day (it is not rewritten).
+  const fullFile = witnessFile('agent-count', log.checkpoints[0]!).content;
+  assert.equal(sameWitnessedDay(fullFile, log.checkpoints[0]!), true);
+  assert.equal(sameWitnessedDay(fullFile, toPublicCheckpoint(log.checkpoints[0] as Checkpoint)), true);
+  // The witness job refuses to write any of it.
+  assert.deepEqual(witnessPlan('agent-count', log.checkpoints, () => undefined).refused, ['2026-09-20', '2026-09-21']);
 });
 
 test('the witnessed agent-count files form a valid withheld v1 chain', async () => {

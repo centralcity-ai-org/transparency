@@ -50,8 +50,12 @@ Checkpoints commit to the total; per-category counts are not published.
   checkpoint. A v1 checkpoint dated after 2026-10-04 (`V1_LAST_DATE`) fails verification: from
   then on only v2 is valid.
 - Witness files for v1 days committed before the signatures were withheld are kept as they are
-  (files are only ever added). The verifier treats such a file as the same day when every field
-  the service still publishes matches exactly.
+  (files are only ever added). The verifier treats a v1 file as the same day when the tree fields
+  match exactly, and so does every signed field both copies carry.
+- A service that predates the withheld form serves full v1 checkpoints; the verifier checks their
+  hash and signature as before. The witness job never writes a checkpoint that carries
+  per-category counts: if the service serves one, the run fails and writes nothing. Deploy order:
+  the service change first, then the witness writes the withheld files.
 
 ## What this repository will hold
 
