@@ -1,14 +1,18 @@
 // Verifies Central City's public agent count end to end, from public data only:
 //   1. every checkpoint's hash, the chain of prev_hash links and the append-only consistency
 //      proofs (verifyChain);
-//   2. every checkpoint's Ed25519 signature against the published key set (/.well-known/jwks.json);
+//   2. every checkpoint's Ed25519 signature against the published key set (/.well-known/jwks.json).
+//      A v1 checkpoint published with subcounts_withheld signs fields that are not public, so its
+//      signature cannot be tied to the published fields: it is reported under `unchecked`, never
+//      as valid and never as a failure;
 //   3. the latest checkpoint's Merkle root, recomputed from the published leaves;
 //   4. the withdrawn list against the latest checkpoint;
 //   5. optionally, a witness folder (this repository's agent-count/) against the service, byte
 //      for byte, and one agent's inclusion proof.
 import {
   type AgentProof,
-  type Checkpoint,
+  type PublicCheckpoint as Checkpoint,
+  isWithheld,
   fromHex,
   merkleRoot,
   toHex,
@@ -39,6 +43,8 @@ export interface Report {
   checkpoints: number;
   latest: { date: string; tree_size: number; withdrawn: number; counted: number; root: string } | null;
   problems: string[];
+  /** Checkpoints whose signature is not checkable because signed fields are withheld. */
+  unchecked: string[];
 }
 
 /** The witness file for a checkpoint: the same path and bytes the service publishes. */
@@ -56,10 +62,15 @@ export async function verifyLog(log: PublicLog): Promise<Report> {
   for (const problem of await verifyChain(checkpoints))
     problems.push(`${problem.date}: ${problem.problem}`);
 
+  const unchecked: string[] = [];
   const keys = new Map(log.keys.filter((key) => key.kid).map((key) => [key.kid!, key]));
   for (const checkpoint of checkpoints) {
     if (!checkpoint.signature) {
       problems.push(`${checkpoint.date}: not signed`);
+      continue;
+    }
+    if (isWithheld(checkpoint)) {
+      unchecked.push(`${checkpoint.date}: signature not checkable, fields withheld`);
       continue;
     }
     const key = keys.get(checkpoint.signature.kid);
@@ -97,6 +108,7 @@ export async function verifyLog(log: PublicLog): Promise<Report> {
       root: latest.root,
     },
     problems,
+    unchecked,
   };
 }
 

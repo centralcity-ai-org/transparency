@@ -5,6 +5,9 @@ import { test } from 'node:test';
 import {
   type Checkpoint,
   type CheckpointBody,
+  type PublicCheckpoint,
+  subcountsCommitment,
+  toPublicCheckpoint,
   agentLeafHash,
   checkpointHash,
   checkpointSigningInput,
@@ -38,7 +41,7 @@ test('RFC 6962 reference vectors: roots, audit paths, consistency proofs', async
 });
 
 /** A synthetic public log: `days` checkpoints over growing trees, signed with a fresh key. */
-async function syntheticLog(sizes: number[]) {
+async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() => 2)) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const jwk = { ...(publicKey.export({ format: 'jwk' }) as { kty: string; crv: string; x: string }), kid: 'test-key' };
   const agents = Array.from({ length: Math.max(...sizes) }, (_, idx) => ({
@@ -47,27 +50,31 @@ async function syntheticLog(sizes: number[]) {
     day: `2026-09-${String(10 + Math.floor(idx / 3)).padStart(2, '0')}`,
   }));
   const leafHashes = await Promise.all(agents.map((a) => agentLeafHash(a.id, a.salt, a.day)));
-  const checkpoints: Checkpoint[] = [];
-  let previous: Checkpoint | null = null;
+  const checkpoints: PublicCheckpoint[] = [];
+  let previous: { hash: string; tree_size: number } | null = null;
   for (const [index, size] of sizes.entries()) {
     const root = toHex(await merkleRoot(leafHashes.slice(0, size)));
-    const body: CheckpointBody = {
-      v: 1,
+    // Synthetic split only; it is never published (v1 is served withheld, v2 commits to it).
+    const split = { in_person_accounts: size - 1, in_ai_workspaces: 1, unclaimed: 0, revoked: 0 };
+    const common: { date: string; tree_size: number; withdrawn: number; root: string; prev_hash: string | null } = {
       date: `2026-09-${String(20 + index).padStart(2, '0')}`,
       tree_size: size,
       withdrawn: 0,
       root,
-      prev_hash: previous?.hash ?? null,
-      subcounts: { in_person_accounts: size - 1, in_ai_workspaces: 1, unclaimed: 0, revoked: 0 },
+      prev_hash: (previous?.hash ?? null) as string | null,
     };
+    const body: CheckpointBody =
+      versions[index] === 1
+        ? { v: 1, ...common, subcounts: split }
+        : { v: 2, ...common, subcounts_commitment: await subcountsCommitment(split, randomBytes(32)) };
     const hash = await checkpointHash(body);
     const sig = sign(null, checkpointSigningInput(hash), privateKey).toString('base64url');
-    const consistency =
+    const consistency: string[] =
       previous && previous.tree_size > 0 && previous.tree_size < size
         ? (await consistencyProof(leafHashes.slice(0, size), previous.tree_size)).map(toHex)
         : [];
     const checkpoint: Checkpoint = { ...body, hash, signature: { kid: 'test-key', sig }, consistency };
-    checkpoints.push(checkpoint);
+    checkpoints.push(toPublicCheckpoint(checkpoint));
     previous = checkpoint;
   }
   const log: PublicLog = {
@@ -117,7 +124,7 @@ test('a rewritten history (not append-only) fails the consistency proof', async 
   const forged = clone(other.log.checkpoints[1]!);
   forged.prev_hash = log.checkpoints[0]!.hash;
   const { hash: _h, signature: _s, consistency: _c, ...body } = forged;
-  forged.hash = await checkpointHash(body);
+  forged.hash = await checkpointHash(body as CheckpointBody);
   const report = await verifyLog({ ...log, checkpoints: [log.checkpoints[0]!, forged] });
   assert.ok(report.problems.some((p) => /append-only/.test(p)), report.problems.join('; '));
 });
@@ -176,4 +183,51 @@ test('fetchLog reads the public routes (paged leaves) and reports an unpublished
   const missing = (async () => new Response('{}', { status: 404 })) as unknown as typeof fetch;
   await assert.rejects(fetchLog('https://example.com', missing), NotPublished);
   await assert.rejects(fetchLog('http://example.com', fake), /https/);
+});
+
+test('v2 checkpoints: the signature covers the body including subcounts_commitment', async () => {
+  const { log } = await syntheticLog([3, 5]);
+  const cp = log.checkpoints[1]!;
+  assert.equal(cp.v, 2);
+  assert.ok(!('subcounts' in cp));
+  assert.match((cp as { subcounts_commitment: string }).subcounts_commitment, /^[0-9a-f]{64}$/);
+  const report = await verifyLog(log);
+  assert.deepEqual([report.problems, report.unchecked], [[], []]);
+  // A changed commitment no longer matches the signed hash.
+  const copy = clone(log);
+  (copy.checkpoints[1] as { subcounts_commitment: string }).subcounts_commitment = 'ab'.repeat(32);
+  assert.ok((await verifyLog(copy)).problems.some((p) => /hash does not match/.test(p)));
+});
+
+test('withheld v1 then v2: chain, consistency and inclusion are checked; v1 signatures are not checkable, not invalid', async () => {
+  const { log, agents } = await syntheticLog([3, 5, 9], [1, 1, 2]);
+  for (const cp of log.checkpoints.slice(0, 2)) {
+    assert.equal((cp as { subcounts_withheld?: boolean }).subcounts_withheld, true);
+    assert.ok(!('subcounts' in cp));
+  }
+  assert.equal(log.checkpoints[2]!.prev_hash, log.checkpoints[1]!.hash);
+  const report = await verifyLog(log);
+  assert.deepEqual(report.problems, []);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.unchecked, [
+    '2026-09-20: signature not checkable, fields withheld',
+    '2026-09-21: signature not checkable, fields withheld',
+  ]);
+  // Chain and consistency still catch tampering on withheld entries.
+  const shrunk = clone(log);
+  shrunk.checkpoints[1]!.tree_size = 4;
+  assert.ok((await verifyLog(shrunk)).problems.some((p) => /append-only/.test(p)));
+  const relinked = clone(log);
+  relinked.checkpoints[1]!.hash = 'ee'.repeat(32);
+  assert.ok((await verifyLog(relinked)).problems.some((p) => /does not link/.test(p)));
+  // Inclusion against a withheld v1 root.
+  const proofs = await Promise.all(
+    [0, 1, 2].map(async (idx) => ({
+      idx,
+      leaf: await agentLeafHash(agents[idx]!.id, agents[idx]!.salt, agents[idx]!.day),
+    })),
+  );
+  const leaves = log.leaves.slice(0, 3).map((l) => fromHex(l.leaf_hash));
+  const path = await inclusionProof(leaves, 1);
+  assert.ok(await verifyInclusion(proofs[1]!.leaf, 1, 3, path, fromHex(log.checkpoints[0]!.root)));
 });

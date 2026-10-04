@@ -1,5 +1,5 @@
 // Reads the public log from a Central City origin. Only public, unauthenticated GET requests.
-import type { Checkpoint } from './count-log.js';
+import type { PublicCheckpoint as Checkpoint } from './count-log.js';
 import type { Jwk, Leaf, PublicLog } from './verify.js';
 
 const PAGE = 10_000;

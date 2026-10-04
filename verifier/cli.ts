@@ -70,6 +70,7 @@ async function main(): Promise<number> {
       console.log(
         `Latest: ${report.latest.date}, ${report.latest.counted} agents counted (${report.latest.tree_size} in the log, ${report.latest.withdrawn} withdrawn), root ${report.latest.root}`,
       );
+    for (const note of report.unchecked) console.log(`NOTE ${note}`);
     for (const problem of report.problems) console.log(`FAIL ${problem}`);
     if (report.ok && report.checkpoints === 0) console.log('RESULT: NO CHECKPOINT PUBLISHED YET (nothing to verify)');
     else console.log(report.ok ? 'RESULT: VERIFIED' : 'RESULT: FAILED');
