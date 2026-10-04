@@ -38,11 +38,20 @@ Checkpoints commit to the total; per-category counts are not published.
   `prev_hash` and `subcounts_commitment`, a SHA-256 over the canonical per-category counts followed
   by 32 random bytes kept by the service. The verifier recomputes the hash from these fields and
   checks the signature over it.
-- **Version 1** (`"v": 1`): published with `"subcounts_withheld": true`. Some fields its hash and
-  signature cover are not published, so the verifier cannot tie the signature to the published
-  fields; it reports these as `NOTE ... signature not checkable, fields withheld` (not as a
-  failure, and not as verified). Their links, sizes, consistency proofs and inclusion proofs are
-  checked like any other checkpoint.
+  v2 starts a new chain: the first v2 checkpoint has `"prev_hash": null`, and each later one
+  links to the previous v2 hash. The consistency proof from the last v1 tree still ties it to the
+  same log.
+- **Version 1** (`"v": 1`, the days up to and including 2026-10-04): v1 signatures are withheld
+  for privacy. A v1 checkpoint is published with only `date`, `tree_size`, `withdrawn`, `root`
+  and its consistency proof, marked `"subcounts_withheld": true` and `"signature_withheld": true`.
+  It is not checkable: the verifier prints `NOTE ... not checkable (v1, signature withheld for
+  privacy)`, never counts it as signed, and ends with `RESULT: VERIFIED (N entries not checkable:
+  withheld)`. Its sizes, consistency proofs and inclusion proofs are checked like any other
+  checkpoint. A v1 checkpoint dated after 2026-10-04 (`V1_LAST_DATE`) fails verification: from
+  then on only v2 is valid.
+- Witness files for v1 days committed before the signatures were withheld are kept as they are
+  (files are only ever added). The verifier treats such a file as the same day when every field
+  the service still publishes matches exactly.
 
 ## What this repository will hold
 
@@ -51,7 +60,7 @@ Checkpoints commit to the total; per-category counts are not published.
   Files are only ever added; CI refuses any change to a witnessed file. Each one records the tree size of the agent log, its
   Merkle root (RFC 6962 hashing), the hash of the previous day's checkpoint, a consistency proof
   from the previous tree, a commitment to the counts behind the total, and an Ed25519 signature
-  with the platform's published signing key.
+  with the platform's published signing key (v1 days: see Checkpoint format).
 - **Verifier** (`verifier/`): a small, dependency-free command-line tool and library that
   fetches the public log and checks the whole chain: every signature, every day linking to the one before, and every new
   tree only appending to the previous one. An agent owner can also check that their own agent is

@@ -289,6 +289,21 @@ export interface CheckpointBodyV2 extends BodyCommon {
 /** A checkpoint body (one per UTC day), before its hash and signature. */
 export type CheckpointBody = CheckpointBodyV1 | CheckpointBodyV2;
 
+/**
+ * The last day with a v1 checkpoint. Verifiers reject any v1 checkpoint dated after it: from the
+ * next day on only v2 is valid, so no new day can be published in the form that cannot be
+ * checked (WithheldCheckpointV1).
+ */
+export const V1_LAST_DATE = '2026-10-04';
+
+/**
+ * The prev_hash of the first v2 checkpoint: v2 starts a new hash chain. v1 hashes are withheld
+ * for privacy, so the first v2 checkpoint links to none of them. It is tied to the v1 log by its
+ * RFC 6962 consistency proof from the last v1 tree (tree_size and root), checked as for any other
+ * day. Every later v2 checkpoint links to the previous v2 hash.
+ */
+export const V2_GENESIS_PREV_HASH = null;
+
 interface Sealed {
   /** SHA-256 of the canonical body, hex. */
   hash: string;
@@ -301,17 +316,39 @@ interface Sealed {
 /** A complete checkpoint as the server stores it (v1 bodies include the private split). */
 export type Checkpoint = CheckpointBody & Sealed;
 
-/** A v1 checkpoint as published today: the split is withheld, so its hash cannot be recomputed. */
-export type WithheldCheckpointV1 = BodyCommon & Sealed & { v: 1; subcounts_withheld: true };
+/** A v2 checkpoint as published: the same as stored. */
+export type PublicCheckpointV2 = CheckpointBodyV2 & Sealed;
 
-/** A checkpoint as the public API serves it: never carries the split. */
-export type PublicCheckpoint = (CheckpointBodyV2 & Sealed) | WithheldCheckpointV1;
-
-export function isWithheld(cp: Checkpoint | PublicCheckpoint): cp is WithheldCheckpointV1 {
-  return cp.v === 1 && (cp as WithheldCheckpointV1).subcounts_withheld === true;
+/**
+ * A v1 checkpoint as published since v2. Its sub-counts, hash, signature and prev_hash are
+ * withheld for privacy, so it is not checkable: no signature covers what is shown. Its tree size
+ * and root still take part in the append-only (consistency) checks, and inclusion proofs verify
+ * against its root.
+ */
+export interface WithheldCheckpointV1 {
+  v: 1;
+  date: string;
+  tree_size: number;
+  withdrawn: number;
+  root: string;
+  subcounts_withheld: true;
+  signature_withheld: true;
+  /** RFC 6962 consistency proof from the previous checkpoint's tree, hex nodes. */
+  consistency: string[];
 }
 
-/** The public form of a stored checkpoint: v1 drops the split and says so; v2 is unchanged. */
+/** A checkpoint as the public API serves it: never carries the split. */
+export type PublicCheckpoint = PublicCheckpointV2 | WithheldCheckpointV1;
+
+/**
+ * Whether this is a v1 checkpoint published without its signed fields. Any hash, signature or
+ * prev_hash an older copy of such an entry still carries is ignored, never checked.
+ */
+export function isWithheld(cp: Checkpoint | PublicCheckpoint): cp is WithheldCheckpointV1 {
+  return cp.v === 1 && (cp as { subcounts_withheld?: unknown }).subcounts_withheld === true;
+}
+
+/** The public form of a stored checkpoint: v2 is unchanged; v1 keeps only unsigned tree facts. */
 export function toPublicCheckpoint(cp: Checkpoint): PublicCheckpoint {
   if (cp.v === 2) {
     const { v, date, tree_size, withdrawn, root, prev_hash, subcounts_commitment } = cp;
@@ -329,17 +366,15 @@ export function toPublicCheckpoint(cp: Checkpoint): PublicCheckpoint {
       consistency,
     };
   }
-  const { date, tree_size, withdrawn, root, prev_hash, hash, signature, consistency } = cp;
+  const { date, tree_size, withdrawn, root, consistency } = cp;
   return {
     v: 1,
     date,
     tree_size,
     withdrawn,
     root,
-    prev_hash,
     subcounts_withheld: true,
-    hash,
-    signature,
+    signature_withheld: true,
     consistency,
   };
 }
@@ -438,12 +473,17 @@ export async function verifyCheckpointSignature(
 export type ChainProblem = { date: string; problem: string };
 
 /**
- * Checks a list of checkpoints (oldest first): each hash is its body's hash, each prev_hash
- * links to the previous hash, sizes never shrink, withdrawn never shrinks, and each consistency
- * proof shows the new tree extends the old one. A v1 checkpoint published with its split
- * withheld (subcounts_withheld) cannot have its hash recomputed, so that one check is skipped for
- * it (see hashCheckable); the links, sizes and proofs are still checked. Full v1 checkpoints
- * (from an older copy) are checked as before, including that the split adds up.
+ * Checks a list of checkpoints (oldest first): each hash is its body's hash, each prev_hash links
+ * to the previous hash, sizes and the withdrawn count never shrink, and each consistency proof
+ * shows the new tree extends the old one. Besides:
+ * - a withheld v1 checkpoint (isWithheld) has no hash or link to check; its size, withdrawn
+ *   count, root and consistency proof are checked like any other;
+ * - no v1 checkpoint may be dated after V1_LAST_DATE;
+ * - v2 starts a new chain: the first v2 checkpoint (the first entry, or the one after a v1
+ *   checkpoint) must have prev_hash V2_GENESIS_PREV_HASH; each later one links to the previous
+ *   v2 hash;
+ * - full v1 checkpoints (an older private copy) are checked as before, including that the split
+ *   adds up.
  */
 export async function verifyChain(
   checkpoints: readonly (Checkpoint | PublicCheckpoint)[],
@@ -456,22 +496,35 @@ export async function verifyChain(
       previous = cp;
       continue;
     }
+    if (cp.v === 1 && !(cp.date <= V1_LAST_DATE))
+      problems.push({
+        date: cp.date,
+        problem: `a v1 checkpoint after ${V1_LAST_DATE} (only v2 is valid from then on)`,
+      });
     if (!isWithheld(cp)) {
       const full = cp as Checkpoint;
       if (full.v === 2 && !/^[0-9a-f]{64}$/.test(full.subcounts_commitment ?? ''))
         problems.push({ date: cp.date, problem: 'malformed sub-count commitment' });
-      if ((await checkpointHash(checkpointBody(full))) !== cp.hash)
+      if ((await checkpointHash(checkpointBody(full))) !== full.hash)
         problems.push({ date: cp.date, problem: 'hash does not match the checkpoint' });
       if (full.v === 1) {
         const s = full.subcounts;
         if (s.in_person_accounts + s.in_ai_workspaces + s.unclaimed !== cp.tree_size - cp.withdrawn)
           problems.push({ date: cp.date, problem: 'sub-counts do not add up' });
       }
-    } else if (!/^[0-9a-f]{64}$/.test(cp.hash))
-      problems.push({ date: cp.date, problem: 'malformed hash' });
-    if (previous) {
-      if (cp.prev_hash !== previous.hash)
+      if (full.v === 2 && (!previous || previous.v === 1)) {
+        if (full.prev_hash !== V2_GENESIS_PREV_HASH)
+          problems.push({
+            date: cp.date,
+            problem: 'the first v2 checkpoint must start a new chain (no previous hash)',
+          });
+      } else if (!previous) {
+        if (full.prev_hash !== null)
+          problems.push({ date: cp.date, problem: 'the first checkpoint must have no previous hash' });
+      } else if (!isWithheld(previous) && full.prev_hash !== (previous as Checkpoint).hash)
         problems.push({ date: cp.date, problem: 'does not link to the previous checkpoint' });
+    }
+    if (previous) {
       if (cp.v < previous.v)
         problems.push({ date: cp.date, problem: 'checkpoint version went backwards' });
       if (cp.date <= previous.date) problems.push({ date: cp.date, problem: 'dates out of order' });
@@ -487,8 +540,7 @@ export async function verifyChain(
         cp.consistency.map(fromHex),
       );
       if (!ok) problems.push({ date: cp.date, problem: 'not an append-only extension' });
-    } else if (cp.prev_hash !== null)
-      problems.push({ date: cp.date, problem: 'the first checkpoint must have no previous hash' });
+    }
     previous = cp;
   }
   return problems;

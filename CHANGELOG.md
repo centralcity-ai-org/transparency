@@ -12,8 +12,11 @@ All notable changes to this repository. Dates are UTC.
 - The daily witness workflow (`witness/update.ts`, `.github/workflows/witness.yml`): verifies,
   then adds new checkpoint files only.
 - Offline tests, including the RFC 6962 reference vectors.
-- The verifier reads checkpoint format v2 (a commitment instead of per-category counts) and v1
-  checkpoints published with `subcounts_withheld` (their signatures are reported as not checkable).
+- The verifier reads checkpoint format v2 (a commitment instead of per-category counts). v1
+  signatures are withheld for privacy: v1 checkpoints are reported as not checkable, the result
+  line says how many, and no v1 checkpoint dated after 2026-10-04 is accepted. v2 starts a new
+  chain (the first v2 checkpoint has no previous hash).
+- The witness never commits per-category counts.
 
 ## 0.0.0 (2026-09-28)
 

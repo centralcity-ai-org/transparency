@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import {
   type Checkpoint,
   type CheckpointBody,
   type PublicCheckpoint,
+  type PublicCheckpointV2,
   subcountsCommitment,
   toPublicCheckpoint,
   agentLeafHash,
@@ -17,10 +18,20 @@ import {
   inclusionProof,
   merkleRoot,
   toHex,
+  V1_LAST_DATE,
+  verifyChain,
   verifyConsistency,
   verifyInclusion,
 } from '../verifier/count-log.js';
-import { compareWitness, verifyAgent, verifyLog, witnessFile, type PublicLog } from '../verifier/verify.js';
+import {
+  compareWitness,
+  resultLine,
+  sameWitnessedDay,
+  verifyAgent,
+  verifyLog,
+  witnessFile,
+  type PublicLog,
+} from '../verifier/verify.js';
 
 const vectors = JSON.parse(readFileSync(new URL('./rfc6962-vectors.json', import.meta.url), 'utf8'));
 
@@ -61,7 +72,9 @@ async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() 
       tree_size: size,
       withdrawn: 0,
       root,
-      prev_hash: (previous?.hash ?? null) as string | null,
+      // v2 starts a new chain: the first v2 checkpoint after v1 has no previous hash.
+      prev_hash:
+        versions[index] === 2 && versions[index - 1] === 1 ? null : ((previous?.hash ?? null) as string | null),
     };
     const body: CheckpointBody =
       versions[index] === 1
@@ -87,6 +100,8 @@ async function syntheticLog(sizes: number[], versions: (1 | 2)[] = sizes.map(() 
 }
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+/** A published v2 checkpoint (these synthetic logs are v2 unless versions say otherwise). */
+const v2 = (cp: PublicCheckpoint | undefined) => cp as PublicCheckpointV2;
 
 test('a valid log verifies', async () => {
   const { log } = await syntheticLog([3, 5, 9]);
@@ -101,10 +116,10 @@ test('tampering is detected: leaf, root, chain, signature, unknown key, missing 
   const cases: Array<[string, (l: PublicLog) => void, RegExp]> = [
     ['leaf', (l) => (l.leaves[4]!.leaf_hash = '00'.repeat(32)), /do not give the checkpoint root/],
     ['count', (l) => (l.checkpoints[1]!.tree_size = 6), /hash does not match/],
-    ['chain', (l) => (l.checkpoints[2]!.prev_hash = '11'.repeat(32)), /does not link|hash does not match/],
-    ['signature', (l) => (l.checkpoints[0]!.signature!.sig = l.checkpoints[1]!.signature!.sig), /bad signature/],
+    ['chain', (l) => (v2(l.checkpoints[2]).prev_hash = '11'.repeat(32)), /does not link|hash does not match/],
+    ['signature', (l) => (v2(l.checkpoints[0]).signature!.sig = v2(l.checkpoints[1]).signature!.sig), /bad signature/],
     ['key', (l) => (l.keys[0]!.kid = 'other'), /is not published/],
-    ['unsigned', (l) => (l.checkpoints[2]!.signature = null), /not signed/],
+    ['unsigned', (l) => (v2(l.checkpoints[2]).signature = null), /not signed/],
     ['missing', (l) => l.leaves.pop(), /leaves are published/],
     ['withdrawn', (l) => l.withdrawn.push({ idx: 1, reason: 'abuse_purge', day: '2026-09-21' }), /withdrawn entries/],
   ];
@@ -121,8 +136,8 @@ test('a rewritten history (not append-only) fails the consistency proof', async 
   const { log } = await syntheticLog([3, 5]);
   const other = await syntheticLog([3, 5]);
   // Day 2 from another log, re-linked to day 1: the hash chain holds, the tree does not extend.
-  const forged = clone(other.log.checkpoints[1]!);
-  forged.prev_hash = log.checkpoints[0]!.hash;
+  const forged = v2(clone(other.log.checkpoints[1]));
+  forged.prev_hash = v2(log.checkpoints[0]).hash;
   const { hash: _h, signature: _s, consistency: _c, ...body } = forged;
   forged.hash = await checkpointHash(body as CheckpointBody);
   const report = await verifyLog({ ...log, checkpoints: [log.checkpoints[0]!, forged] });
@@ -199,35 +214,138 @@ test('v2 checkpoints: the signature covers the body including subcounts_commitme
   assert.ok((await verifyLog(copy)).problems.some((p) => /hash does not match/.test(p)));
 });
 
-test('withheld v1 then v2: chain, consistency and inclusion are checked; v1 signatures are not checkable, not invalid', async () => {
+test('withheld v1 then v2: sizes, consistency and inclusion are checked; v1 entries are not checkable, not invalid', async () => {
   const { log, agents } = await syntheticLog([3, 5, 9], [1, 1, 2]);
   for (const cp of log.checkpoints.slice(0, 2)) {
-    assert.equal((cp as { subcounts_withheld?: boolean }).subcounts_withheld, true);
-    assert.ok(!('subcounts' in cp));
+    assert.deepEqual(Object.keys(cp), [
+      'v',
+      'date',
+      'tree_size',
+      'withdrawn',
+      'root',
+      'subcounts_withheld',
+      'signature_withheld',
+      'consistency',
+    ]);
+    // No hash, signature or link is published for a v1 checkpoint; the only digests left are
+    // tree nodes.
+    for (const hex of JSON.stringify(cp).match(/[0-9a-f]{64}/g) ?? [])
+      assert.ok(hex === cp.root || cp.consistency.includes(hex), hex);
   }
-  assert.equal(log.checkpoints[2]!.prev_hash, log.checkpoints[1]!.hash);
   const report = await verifyLog(log);
   assert.deepEqual(report.problems, []);
   assert.equal(report.ok, true);
   assert.deepEqual(report.unchecked, [
-    '2026-09-20: signature not checkable, fields withheld',
-    '2026-09-21: signature not checkable, fields withheld',
+    '2026-09-20: not checkable (v1, signature withheld for privacy)',
+    '2026-09-21: not checkable (v1, signature withheld for privacy)',
   ]);
-  // Chain and consistency still catch tampering on withheld entries.
+  // Consistency still catches tampering on withheld entries.
   const shrunk = clone(log);
   shrunk.checkpoints[1]!.tree_size = 4;
   assert.ok((await verifyLog(shrunk)).problems.some((p) => /append-only/.test(p)));
-  const relinked = clone(log);
-  relinked.checkpoints[1]!.hash = 'ee'.repeat(32);
-  assert.ok((await verifyLog(relinked)).problems.some((p) => /does not link/.test(p)));
+  const rerooted = clone(log);
+  rerooted.checkpoints[0]!.root = 'ee'.repeat(32);
+  assert.ok((await verifyLog(rerooted)).problems.some((p) => /append-only/.test(p)));
   // Inclusion against a withheld v1 root.
-  const proofs = await Promise.all(
-    [0, 1, 2].map(async (idx) => ({
-      idx,
-      leaf: await agentLeafHash(agents[idx]!.id, agents[idx]!.salt, agents[idx]!.day),
-    })),
-  );
+  const leaf = await agentLeafHash(agents[1]!.id, agents[1]!.salt, agents[1]!.day);
   const leaves = log.leaves.slice(0, 3).map((l) => fromHex(l.leaf_hash));
   const path = await inclusionProof(leaves, 1);
-  assert.ok(await verifyInclusion(proofs[1]!.leaf, 1, 3, path, fromHex(log.checkpoints[0]!.root)));
+  assert.ok(await verifyInclusion(leaf, 1, 3, path, fromHex(log.checkpoints[0]!.root)));
+});
+
+test('v2 starts a new chain: only the first v2 checkpoint has no previous hash', async () => {
+  const { log } = await syntheticLog([3, 5, 9, 12], [1, 1, 2, 2]);
+  const [, , first, second] = log.checkpoints as [unknown, unknown, Checkpoint, Checkpoint];
+  assert.equal(first.prev_hash, null);
+  assert.equal(second.prev_hash, first.hash);
+  assert.deepEqual((await verifyLog(log)).problems, []);
+  // A first v2 checkpoint that links to something else is rejected.
+  const linked = clone(log);
+  const body = { ...(linked.checkpoints[2] as Checkpoint), prev_hash: 'cd'.repeat(32) };
+  const { hash: _h, signature: _s, consistency: _c, ...rest } = body;
+  linked.checkpoints[2] = { ...body, hash: await checkpointHash(rest as CheckpointBody) } as PublicCheckpoint;
+  assert.ok((await verifyLog(linked)).problems.some((p) => /first v2 checkpoint/.test(p)));
+  // A later v2 checkpoint may not start another chain.
+  const restarted = clone(log);
+  (restarted.checkpoints[3] as Checkpoint).prev_hash = null;
+  assert.ok((await verifyLog(restarted)).problems.some((p) => /does not link|hash does not match/.test(p)));
+});
+
+test(`a v1 checkpoint dated after ${V1_LAST_DATE} fails; on that day it is valid`, async () => {
+  const { log } = await syntheticLog([3, 5], [1, 1]);
+  const onCutoff = clone(log.checkpoints);
+  onCutoff[1]!.date = V1_LAST_DATE;
+  assert.deepEqual(await verifyChain(onCutoff), []);
+  const late = clone(log);
+  late.checkpoints[1]!.date = '2026-10-05';
+  const report = await verifyLog(late);
+  assert.equal(report.ok, false);
+  assert.ok(
+    report.problems.some((p) => p.startsWith('2026-10-05: a v1 checkpoint after 2026-10-04')),
+    report.problems.join('; '),
+  );
+});
+
+test('the CLI result is never a plain VERIFIED when entries were not checkable', () => {
+  assert.equal(resultLine({ ok: true, unchecked: [] }), 'RESULT: VERIFIED');
+  assert.equal(resultLine({ ok: true, unchecked: ['a'] }), 'RESULT: VERIFIED (1 entry not checkable: withheld)');
+  assert.equal(
+    resultLine({ ok: true, unchecked: ['a', 'b', 'c'] }),
+    'RESULT: VERIFIED (3 entries not checkable: withheld)',
+  );
+  assert.equal(resultLine({ ok: false, unchecked: ['a'] }), 'RESULT: FAILED');
+});
+
+test('witness: per-category counts are never witnessed; older copies of withheld v1 days still match', async () => {
+  const { log } = await syntheticLog([3, 5, 9], [1, 1, 2]);
+  const v1 = log.checkpoints[0]!;
+  // An older copy of the same day, with fields the service no longer publishes.
+  const { signature_withheld: _w, ...base } = v1 as PublicCheckpoint & { signature_withheld?: true };
+  const older = { ...base, prev_hash: null, hash: 'ab'.repeat(32), signature: { kid: 'test-key', sig: 'x' } };
+  const content = `${JSON.stringify(older, null, 2)}\n`;
+  assert.equal(sameWitnessedDay(content, v1), true);
+  assert.deepEqual(
+    compareWitness('agent-count', new Map([['agent-count/2026/2026-09-20.json', content]]), log.checkpoints),
+    [],
+  );
+  // Every field still published must match.
+  assert.equal(sameWitnessedDay(content.replace('"tree_size": 3', '"tree_size": 4'), v1), false);
+  assert.equal(sameWitnessedDay(content, { ...v1, root: 'ee'.repeat(32) }), false);
+  // A v2 day matches byte for byte only.
+  const v2 = log.checkpoints[2]!;
+  assert.equal(sameWitnessedDay(witnessFile('agent-count', v2).content, v2), true);
+  assert.equal(sameWitnessedDay(witnessFile('agent-count', v2).content.replace(/\n$/, ''), v2), false);
+  // A checkpoint with per-category counts is refused; a witnessed file with them never matches.
+  const full = { ...v1, subcounts: { in_person_accounts: 1, in_ai_workspaces: 1, unclaimed: 1, revoked: 0 } };
+  assert.throws(() => witnessFile('agent-count', full as unknown as PublicCheckpoint), /never witnessed/);
+  assert.equal(sameWitnessedDay(`${JSON.stringify(full, null, 2)}\n`, v1), false);
+});
+
+test('the witnessed agent-count files form a valid withheld v1 chain', async () => {
+  const folder = new URL('../agent-count/2026/', import.meta.url);
+  const files = readdirSync(folder)
+    .filter((name) => name.endsWith('.json'))
+    .sort();
+  assert.ok(files.length > 0);
+  const published: PublicCheckpoint[] = [];
+  for (const name of files) {
+    const content = readFileSync(new URL(name, folder), 'utf8');
+    const witnessed = JSON.parse(content) as Record<string, unknown>;
+    assert.ok(!('subcounts' in witnessed), name);
+    // The form the service publishes for that day now.
+    const live = {
+      v: 1,
+      date: witnessed.date,
+      tree_size: witnessed.tree_size,
+      withdrawn: witnessed.withdrawn,
+      root: witnessed.root,
+      subcounts_withheld: true,
+      signature_withheld: true,
+      consistency: witnessed.consistency,
+    } as PublicCheckpoint;
+    assert.equal(sameWitnessedDay(content, live), true, name);
+    assert.ok(live.date <= V1_LAST_DATE, name);
+    published.push(live);
+  }
+  assert.deepEqual(await verifyChain(published), []);
 });

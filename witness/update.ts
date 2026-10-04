@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { NotPublished, fetchLog } from '../verifier/fetch.js';
-import { verifyLog, witnessFile } from '../verifier/verify.js';
+import { sameWitnessedDay, verifyLog, witnessFile } from '../verifier/verify.js';
 
 const argv = process.argv.slice(2);
 const option = (name: string, fallback: string) => {
@@ -41,7 +41,7 @@ async function main(): Promise<number> {
   for (const checkpoint of log.checkpoints) {
     const file = witnessFile(folder, checkpoint);
     if (existsSync(file.path)) {
-      if (readFileSync(file.path, 'utf8') !== file.content) changed.push(file.path);
+      if (!sameWitnessedDay(readFileSync(file.path, 'utf8'), checkpoint)) changed.push(file.path);
       continue;
     }
     mkdirSync(dirname(file.path), { recursive: true });
