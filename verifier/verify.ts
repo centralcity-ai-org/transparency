@@ -1,14 +1,19 @@
 // Verifies Central City's public agent count end to end, from public data only:
 //   1. every checkpoint's hash, the chain of prev_hash links and the append-only consistency
 //      proofs (verifyChain);
-//   2. every checkpoint's Ed25519 signature against the published key set (/.well-known/jwks.json);
+//   2. every checkpoint's Ed25519 signature against the published key set (/.well-known/jwks.json).
+//      v1 signatures are withheld for privacy, so a v1 checkpoint is not checkable: it is reported
+//      under `unchecked`, never as valid and never as a failure. No v1 checkpoint may be dated
+//      after V1_LAST_DATE, and v2 starts a new chain (see verifyChain);
 //   3. the latest checkpoint's Merkle root, recomputed from the published leaves;
 //   4. the withdrawn list against the latest checkpoint;
 //   5. optionally, a witness folder (this repository's agent-count/) against the service, byte
-//      for byte, and one agent's inclusion proof.
+//      for byte (see sameWitnessedDay), and one agent's inclusion proof.
 import {
   type AgentProof,
-  type Checkpoint,
+  type Checkpoint as FullCheckpoint,
+  type PublicCheckpoint,
+  isWithheld,
   fromHex,
   merkleRoot,
   toHex,
@@ -16,6 +21,15 @@ import {
   verifyChain,
   verifyCheckpointSignature,
 } from './count-log.js';
+
+/**
+ * A checkpoint as a service may serve it: v2, a withheld v1, or (from a service that predates
+ * the withheld form) a full legacy v1, whose hash and signature are checked as before.
+ */
+export type Checkpoint = PublicCheckpoint | FullCheckpoint;
+
+/** Whether a checkpoint carries per-category counts (a full legacy v1). */
+export const hasSubcounts = (checkpoint: Checkpoint) => 'subcounts' in checkpoint;
 
 export interface Jwk {
   kty: string;
@@ -39,9 +53,14 @@ export interface Report {
   checkpoints: number;
   latest: { date: string; tree_size: number; withdrawn: number; counted: number; root: string } | null;
   problems: string[];
+  /** Checkpoints that are not checkable: v1 signatures are withheld for privacy. */
+  unchecked: string[];
 }
 
-/** The witness file for a checkpoint: the same path and bytes the service publishes. */
+/**
+ * The witness file for a checkpoint: the same path and bytes the service publishes. The witness
+ * job (witness/update.ts) refuses to write one that carries per-category counts (hasSubcounts).
+ */
 export function witnessFile(folder: string, checkpoint: Checkpoint) {
   const [year] = checkpoint.date.split('-');
   return {
@@ -50,14 +69,27 @@ export function witnessFile(folder: string, checkpoint: Checkpoint) {
   };
 }
 
+/** Never a plain VERIFIED when some entries could not be checked. */
+export function resultLine(report: Pick<Report, 'ok' | 'unchecked'>): string {
+  if (!report.ok) return 'RESULT: FAILED';
+  const n = report.unchecked.length;
+  if (n === 0) return 'RESULT: VERIFIED';
+  return `RESULT: VERIFIED (${n} ${n === 1 ? 'entry' : 'entries'} not checkable: withheld)`;
+}
+
 export async function verifyLog(log: PublicLog): Promise<Report> {
   const problems: string[] = [];
   const checkpoints = [...log.checkpoints].sort((a, b) => a.date.localeCompare(b.date));
   for (const problem of await verifyChain(checkpoints))
     problems.push(`${problem.date}: ${problem.problem}`);
 
+  const unchecked: string[] = [];
   const keys = new Map(log.keys.filter((key) => key.kid).map((key) => [key.kid!, key]));
   for (const checkpoint of checkpoints) {
+    if (isWithheld(checkpoint)) {
+      unchecked.push(`${checkpoint.date}: not checkable (v1, signature withheld for privacy)`);
+      continue;
+    }
     if (!checkpoint.signature) {
       problems.push(`${checkpoint.date}: not signed`);
       continue;
@@ -97,7 +129,59 @@ export async function verifyLog(log: PublicLog): Promise<Report> {
       root: latest.root,
     },
     problems,
+    unchecked,
   };
+}
+
+/** The tree fields every form of a v1 checkpoint publishes. */
+const V1_TREE_FIELDS = ['v', 'date', 'tree_size', 'withdrawn', 'root', 'consistency'] as const;
+/** Further v1 fields compared when both copies carry them. */
+const V1_OPTIONAL_FIELDS = ['prev_hash', 'hash', 'signature'] as const;
+
+/**
+ * Whether a witnessed file records the same day the service publishes: byte for byte, with one
+ * exception for v1 days. A v1 day may be witnessed in an older form than the service serves now
+ * (with or without its signed fields); the file is kept as it is (files are only ever added). The
+ * two copies are the same day when the tree fields match exactly, and so does every signed field
+ * both copies carry.
+ */
+export function sameWitnessedDay(content: string, live: Checkpoint): boolean {
+  if (content === witnessFile('', live).content) return true;
+  if (live.v !== 1) return false;
+  let witnessed: Record<string, unknown>;
+  try {
+    witnessed = JSON.parse(content) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (witnessed === null || typeof witnessed !== 'object' || witnessed.v !== 1) return false;
+  const current = live as unknown as Record<string, unknown>;
+  const same = (key: string) => JSON.stringify(witnessed[key]) === JSON.stringify(current[key]);
+  if (!V1_TREE_FIELDS.every(same)) return false;
+  return V1_OPTIONAL_FIELDS.every((key) => !(key in witnessed) || !(key in current) || same(key));
+}
+
+/**
+ * What the witness job does with the service's checkpoints, given the files it already has
+ * (`read` returns a file's content, or undefined when there is none): files to add, witnessed
+ * days whose content changed, and days refused because they carry per-category counts. When any
+ * day is refused, nothing is added.
+ */
+export function witnessPlan(
+  folder: string,
+  checkpoints: readonly Checkpoint[],
+  read: (path: string) => string | undefined,
+): { add: { path: string; content: string }[]; changed: string[]; refused: string[] } {
+  const refused = checkpoints.filter(hasSubcounts).map((cp) => cp.date);
+  const add: { path: string; content: string }[] = [];
+  const changed: string[] = [];
+  for (const checkpoint of checkpoints) {
+    const file = witnessFile(folder, checkpoint);
+    const existing = read(file.path);
+    if (existing === undefined) add.push(file);
+    else if (!sameWitnessedDay(existing, checkpoint)) changed.push(file.path);
+  }
+  return { add: refused.length ? [] : add, changed, refused };
 }
 
 /** Compares witness files (path → content) with the service's checkpoints. */
@@ -107,11 +191,11 @@ export function compareWitness(
   checkpoints: readonly Checkpoint[],
 ): string[] {
   const problems: string[] = [];
-  const expected = new Map(checkpoints.map((cp) => [witnessFile(folder, cp).path, witnessFile(folder, cp).content]));
+  const expected = new Map(checkpoints.map((cp) => [witnessFile(folder, cp).path, cp]));
   for (const [path, content] of files) {
     const live = expected.get(path);
     if (live === undefined) problems.push(`${path}: witnessed, but the service no longer publishes it`);
-    else if (live !== content) problems.push(`${path}: the service now publishes different content`);
+    else if (!sameWitnessedDay(content, live)) problems.push(`${path}: the service now publishes different content`);
   }
   return problems;
 }

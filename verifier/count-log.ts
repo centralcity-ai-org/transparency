@@ -12,7 +12,8 @@
 export const LEAF_CONTEXT = 'cc-agent-leaf/v1';
 /** Signing context: a checkpoint signature can never be confused with an Agent Card JWS. */
 export const CHECKPOINT_SIGNING_CONTEXT = 'centralcity:agent-count-checkpoint:v1';
-export const CHECKPOINT_VERSION = 1;
+/** The version of new checkpoints (v1 is historical; its published form withholds the split). */
+export const CHECKPOINT_VERSION = 2;
 
 const encoder = new TextEncoder();
 const subtle = () => {
@@ -254,6 +255,10 @@ export async function verifyConsistency(
   return sn === 0 && equalBytes(fr, oldRoot) && equalBytes(sr, newRoot);
 }
 
+/**
+ * The per-category split of the count. Server-side only: since checkpoint v2 it is never
+ * published, only committed to (subcountsCommitment).
+ */
 export interface Subcounts {
   in_person_accounts: number;
   in_ai_workspaces: number;
@@ -261,18 +266,45 @@ export interface Subcounts {
   revoked: number;
 }
 
-/** The public checkpoint (one per UTC day), before its hash and signature. */
-export interface CheckpointBody {
-  v: 1;
+interface BodyCommon {
   date: string;
   tree_size: number;
   withdrawn: number;
   root: string;
   prev_hash: string | null;
+}
+
+/** Version 1 (historical): the split was part of the signed body. */
+export interface CheckpointBodyV1 extends BodyCommon {
+  v: 1;
   subcounts: Subcounts;
 }
 
-export interface Checkpoint extends CheckpointBody {
+/** Version 2: the split is replaced by a salted SHA-256 commitment to it (hex). */
+export interface CheckpointBodyV2 extends BodyCommon {
+  v: 2;
+  subcounts_commitment: string;
+}
+
+/** A checkpoint body (one per UTC day), before its hash and signature. */
+export type CheckpointBody = CheckpointBodyV1 | CheckpointBodyV2;
+
+/**
+ * The last day with a v1 checkpoint. Verifiers reject any v1 checkpoint dated after it: from the
+ * next day on only v2 is valid, so no new day can be published in the form that cannot be
+ * checked (WithheldCheckpointV1).
+ */
+export const V1_LAST_DATE = '2026-10-04';
+
+/**
+ * The prev_hash of the first v2 checkpoint: v2 starts a new hash chain. v1 hashes are withheld
+ * for privacy, so the first v2 checkpoint links to none of them. It is tied to the v1 log by its
+ * RFC 6962 consistency proof from the last v1 tree (tree_size and root), checked as for any other
+ * day. Every later v2 checkpoint links to the previous v2 hash.
+ */
+export const V2_GENESIS_PREV_HASH = null;
+
+interface Sealed {
   /** SHA-256 of the canonical body, hex. */
   hash: string;
   /** Ed25519 over CHECKPOINT_SIGNING_CONTEXT ‖ "\n" ‖ hash, base64url; kid names the JWKS key. */
@@ -281,9 +313,99 @@ export interface Checkpoint extends CheckpointBody {
   consistency: string[];
 }
 
+/** A complete checkpoint as the server stores it (v1 bodies include the private split). */
+export type Checkpoint = CheckpointBody & Sealed;
+
+/** A v2 checkpoint as published: the same as stored. */
+export type PublicCheckpointV2 = CheckpointBodyV2 & Sealed;
+
+/**
+ * A v1 checkpoint as published since v2. Its sub-counts, hash, signature and prev_hash are
+ * withheld for privacy, so it is not checkable: no signature covers what is shown. Its tree size
+ * and root still take part in the append-only (consistency) checks, and inclusion proofs verify
+ * against its root.
+ */
+export interface WithheldCheckpointV1 {
+  v: 1;
+  date: string;
+  tree_size: number;
+  withdrawn: number;
+  root: string;
+  subcounts_withheld: true;
+  signature_withheld: true;
+  /** RFC 6962 consistency proof from the previous checkpoint's tree, hex nodes. */
+  consistency: string[];
+}
+
+/** A checkpoint as the public API serves it: never carries the split. */
+export type PublicCheckpoint = PublicCheckpointV2 | WithheldCheckpointV1;
+
+/**
+ * Whether this is a v1 checkpoint published without its signed fields. Any hash, signature or
+ * prev_hash an older copy of such an entry still carries is ignored, never checked.
+ */
+export function isWithheld(cp: Checkpoint | PublicCheckpoint): cp is WithheldCheckpointV1 {
+  return cp.v === 1 && (cp as { subcounts_withheld?: unknown }).subcounts_withheld === true;
+}
+
+/** The public form of a stored checkpoint: v2 is unchanged; v1 keeps only unsigned tree facts. */
+export function toPublicCheckpoint(cp: Checkpoint): PublicCheckpoint {
+  if (cp.v === 2) {
+    const { v, date, tree_size, withdrawn, root, prev_hash, subcounts_commitment } = cp;
+    const { hash, signature, consistency } = cp;
+    return {
+      v,
+      date,
+      tree_size,
+      withdrawn,
+      root,
+      prev_hash,
+      subcounts_commitment,
+      hash,
+      signature,
+      consistency,
+    };
+  }
+  const { date, tree_size, withdrawn, root, consistency } = cp;
+  return {
+    v: 1,
+    date,
+    tree_size,
+    withdrawn,
+    root,
+    subcounts_withheld: true,
+    signature_withheld: true,
+    consistency,
+  };
+}
+
+function canonicalSubcounts(s: Subcounts): string {
+  return JSON.stringify({
+    in_person_accounts: s.in_person_accounts,
+    in_ai_workspaces: s.in_ai_workspaces,
+    unclaimed: s.unclaimed,
+    revoked: s.revoked,
+  });
+}
+
+/** sha256(canonical(subcounts) ‖ salt), hex; the salt is 32 random bytes kept server-side. */
+export async function subcountsCommitment(subcounts: Subcounts, salt: Uint8Array): Promise<string> {
+  if (salt.length !== 32) throw new Error('The commitment salt must be 32 bytes.');
+  return toHex(await sha256(concat(encoder.encode(canonicalSubcounts(subcounts)), salt)));
+}
+
 /** Canonical JSON: fixed key order, no whitespace. */
 export function canonicalCheckpoint(body: CheckpointBody): string {
-  const s = body.subcounts;
+  if (body.v === 2)
+    return JSON.stringify({
+      v: 2,
+      date: body.date,
+      tree_size: body.tree_size,
+      withdrawn: body.withdrawn,
+      root: body.root,
+      prev_hash: body.prev_hash,
+      subcounts_commitment: body.subcounts_commitment,
+    });
   return JSON.stringify({
     v: body.v,
     date: body.date,
@@ -291,17 +413,22 @@ export function canonicalCheckpoint(body: CheckpointBody): string {
     withdrawn: body.withdrawn,
     root: body.root,
     prev_hash: body.prev_hash,
-    subcounts: {
-      in_person_accounts: s.in_person_accounts,
-      in_ai_workspaces: s.in_ai_workspaces,
-      unclaimed: s.unclaimed,
-      revoked: s.revoked,
-    },
+    subcounts: JSON.parse(canonicalSubcounts(body.subcounts)) as Subcounts,
   });
 }
 
 export async function checkpointHash(body: CheckpointBody): Promise<string> {
   return toHex(await sha256(encoder.encode(canonicalCheckpoint(body))));
+}
+
+/** The body of a full checkpoint, without its hash, signature and proof. */
+export function checkpointBody(cp: Checkpoint): CheckpointBody {
+  if (cp.v === 2) {
+    const { v, date, tree_size, withdrawn, root, prev_hash, subcounts_commitment } = cp;
+    return { v, date, tree_size, withdrawn, root, prev_hash, subcounts_commitment };
+  }
+  const { v, date, tree_size, withdrawn, root, prev_hash, subcounts } = cp;
+  return { v, date, tree_size, withdrawn, root, prev_hash, subcounts };
 }
 
 /** The exact bytes a checkpoint signature covers (domain-separated). */
@@ -346,23 +473,60 @@ export async function verifyCheckpointSignature(
 export type ChainProblem = { date: string; problem: string };
 
 /**
- * Checks a list of checkpoints (oldest first): each hash is its body's hash, each prev_hash
- * links to the previous hash, sizes never shrink, withdrawn never shrinks, sub-counts add up,
- * and each consistency proof shows the new tree extends the old one.
+ * Checks a list of checkpoints (oldest first): each hash is its body's hash, each prev_hash links
+ * to the previous hash, sizes and the withdrawn count never shrink, and each consistency proof
+ * shows the new tree extends the old one. Besides:
+ * - a withheld v1 checkpoint (isWithheld) has no hash or link to check; its size, withdrawn
+ *   count, root and consistency proof are checked like any other;
+ * - no v1 checkpoint may be dated after V1_LAST_DATE;
+ * - v2 starts a new chain: the first v2 checkpoint (the first entry, or the one after a v1
+ *   checkpoint) must have prev_hash V2_GENESIS_PREV_HASH; each later one links to the previous
+ *   v2 hash;
+ * - full v1 checkpoints (an older private copy) are checked as before, including that the split
+ *   adds up.
  */
-export async function verifyChain(checkpoints: readonly Checkpoint[]): Promise<ChainProblem[]> {
+export async function verifyChain(
+  checkpoints: readonly (Checkpoint | PublicCheckpoint)[],
+): Promise<ChainProblem[]> {
   const problems: ChainProblem[] = [];
-  let previous: Checkpoint | null = null;
+  let previous: Checkpoint | PublicCheckpoint | null = null;
   for (const cp of checkpoints) {
-    const { hash: _h, signature: _s, consistency: _c, ...body } = cp;
-    if ((await checkpointHash(body)) !== cp.hash)
-      problems.push({ date: cp.date, problem: 'hash does not match the checkpoint' });
-    const s = cp.subcounts;
-    if (s.in_person_accounts + s.in_ai_workspaces + s.unclaimed !== cp.tree_size - cp.withdrawn)
-      problems.push({ date: cp.date, problem: 'sub-counts do not add up' });
-    if (previous) {
-      if (cp.prev_hash !== previous.hash)
+    if ((cp.v as number) !== 1 && (cp.v as number) !== 2) {
+      problems.push({ date: (cp as { date: string }).date, problem: 'unknown checkpoint version' });
+      previous = cp;
+      continue;
+    }
+    if (cp.v === 1 && !(cp.date <= V1_LAST_DATE))
+      problems.push({
+        date: cp.date,
+        problem: `a v1 checkpoint after ${V1_LAST_DATE} (only v2 is valid from then on)`,
+      });
+    if (!isWithheld(cp)) {
+      const full = cp as Checkpoint;
+      if (full.v === 2 && !/^[0-9a-f]{64}$/.test(full.subcounts_commitment ?? ''))
+        problems.push({ date: cp.date, problem: 'malformed sub-count commitment' });
+      if ((await checkpointHash(checkpointBody(full))) !== full.hash)
+        problems.push({ date: cp.date, problem: 'hash does not match the checkpoint' });
+      if (full.v === 1) {
+        const s = full.subcounts;
+        if (s.in_person_accounts + s.in_ai_workspaces + s.unclaimed !== cp.tree_size - cp.withdrawn)
+          problems.push({ date: cp.date, problem: 'sub-counts do not add up' });
+      }
+      if (full.v === 2 && (!previous || previous.v === 1)) {
+        if (full.prev_hash !== V2_GENESIS_PREV_HASH)
+          problems.push({
+            date: cp.date,
+            problem: 'the first v2 checkpoint must start a new chain (no previous hash)',
+          });
+      } else if (!previous) {
+        if (full.prev_hash !== null)
+          problems.push({ date: cp.date, problem: 'the first checkpoint must have no previous hash' });
+      } else if (!isWithheld(previous) && full.prev_hash !== (previous as Checkpoint).hash)
         problems.push({ date: cp.date, problem: 'does not link to the previous checkpoint' });
+    }
+    if (previous) {
+      if (cp.v < previous.v)
+        problems.push({ date: cp.date, problem: 'checkpoint version went backwards' });
       if (cp.date <= previous.date) problems.push({ date: cp.date, problem: 'dates out of order' });
       if (cp.tree_size < previous.tree_size)
         problems.push({ date: cp.date, problem: 'the log shrank' });
@@ -376,11 +540,15 @@ export async function verifyChain(checkpoints: readonly Checkpoint[]): Promise<C
         cp.consistency.map(fromHex),
       );
       if (!ok) problems.push({ date: cp.date, problem: 'not an append-only extension' });
-    } else if (cp.prev_hash !== null)
-      problems.push({ date: cp.date, problem: 'the first checkpoint must have no previous hash' });
+    }
     previous = cp;
   }
   return problems;
+}
+
+/** Whether a checkpoint's hash can be recomputed from what was published. */
+export function hashCheckable(cp: Checkpoint | PublicCheckpoint): boolean {
+  return !isWithheld(cp);
 }
 
 /** Everything an owner needs to check one agent (from GET /api/agents/:id/count-proof). */
@@ -397,7 +565,7 @@ export interface AgentProof {
 export async function verifyAgentProof(
   agentId: string,
   proof: AgentProof,
-  checkpoint: Pick<Checkpoint, 'date' | 'tree_size' | 'root'>,
+  checkpoint: Pick<PublicCheckpoint, 'date' | 'tree_size' | 'root'>,
 ): Promise<{ ok: true } | { ok: false; step: string }> {
   if (proof.checkpoint_date !== checkpoint.date || proof.tree_size !== checkpoint.tree_size)
     return { ok: false, step: 'the proof is for a different checkpoint' };

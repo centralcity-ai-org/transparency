@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { NotPublished, fetchLog } from '../verifier/fetch.js';
-import { verifyLog, witnessFile } from '../verifier/verify.js';
+import { verifyLog, witnessPlan } from '../verifier/verify.js';
 
 const argv = process.argv.slice(2);
 const option = (name: string, fallback: string) => {
@@ -36,20 +36,19 @@ async function main(): Promise<number> {
     for (const problem of report.problems) console.error(`FAIL ${problem}`);
     return 1;
   }
-  let added = 0;
-  const changed: string[] = [];
-  for (const checkpoint of log.checkpoints) {
-    const file = witnessFile(folder, checkpoint);
-    if (existsSync(file.path)) {
-      if (readFileSync(file.path, 'utf8') !== file.content) changed.push(file.path);
-      continue;
-    }
+  const plan = witnessPlan(folder, log.checkpoints, (path) =>
+    existsSync(path) ? readFileSync(path, 'utf8') : undefined,
+  );
+  for (const date of plan.refused)
+    console.error(`FAIL ${date}: the service publishes per-category counts; nothing is written`);
+  if (plan.refused.length) return 1;
+  for (const file of plan.add) {
     mkdirSync(dirname(file.path), { recursive: true });
     writeFileSync(file.path, file.content);
-    added += 1;
   }
-  if (changed.length) {
-    for (const path of changed) console.error(`FAIL ${path}: the service now publishes different content for a witnessed day`);
+  const added = plan.add.length;
+  if (plan.changed.length) {
+    for (const path of plan.changed) console.error(`FAIL ${path}: the service now publishes different content for a witnessed day`);
     return 1;
   }
   console.log(`Verified ${report.checkpoints} checkpoints; added ${added} witness file(s).`);

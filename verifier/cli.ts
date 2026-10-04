@@ -8,7 +8,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fetchLog } from './fetch.js';
-import { compareWitness, verifyAgent, verifyLog } from './verify.js';
+import { compareWitness, resultLine, verifyAgent, verifyLog } from './verify.js';
 
 function args(argv: string[]) {
   const out: Record<string, string | true> = {};
@@ -70,9 +70,10 @@ async function main(): Promise<number> {
       console.log(
         `Latest: ${report.latest.date}, ${report.latest.counted} agents counted (${report.latest.tree_size} in the log, ${report.latest.withdrawn} withdrawn), root ${report.latest.root}`,
       );
+    for (const note of report.unchecked) console.log(`NOTE ${note}`);
     for (const problem of report.problems) console.log(`FAIL ${problem}`);
     if (report.ok && report.checkpoints === 0) console.log('RESULT: NO CHECKPOINT PUBLISHED YET (nothing to verify)');
-    else console.log(report.ok ? 'RESULT: VERIFIED' : 'RESULT: FAILED');
+    else console.log(resultLine(report));
   }
   return report.ok ? 0 : 1;
 }
