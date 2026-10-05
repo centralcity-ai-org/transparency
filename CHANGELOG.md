@@ -4,6 +4,12 @@ All notable changes to this repository. Dates are UTC.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.1.0 (2026-10-05)
+
+First release: anyone can check Central City's public agent count from public data only.
+
 - Links point to the GitHub organization `centralcity-ai-org` (was `centralcity-ai`). README status:
   checkpoints have been published daily since 2026-09-30.
 - The verifier (`verifier/`): checkpoint hashes, signatures, the prev_hash chain, RFC 6962
